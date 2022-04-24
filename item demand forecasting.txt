@@ -1,0 +1,136 @@
+
+train = pd.read_csv('Data/train.csv')
+test = pd.read_csv('Data/test.csv')
+
+
+def date_features(df):
+    
+    df['date'] = pd.to_datetime(dataset['date'])
+    df['year'] = dataset.date.dt.year
+    df['month'] = dataset.date.dt.month
+    df['day'] = dataset.date.dt.day
+    df['dayofyear'] = dataset.date.dt.dayofyear
+    df['dayofweek'] = dataset.date.dt.dayofweek
+    df['weekofyear'] = dataset.date.dt.weekofyear
+    
+    
+    df['day^year'] = np.log((np.log(dataset['dayofyear'] + 1)) ** (dataset['year'] - 2000))
+    
+    
+    df.drop('date', axis=1, inplace=True)
+    
+    return df
+
+
+train, test = date_features(train), date_features(test)
+
+train['daily_avg']  = train.groupby(['item','store','dayofweek'])['sales'].transform('mean')
+train['monthly_avg'] = train.groupby(['item','store','month'])['sales'].transform('mean')
+train = train.dropna()
+
+
+daymonth_avg = train.groupby(['item','store','dayofweek'])['sales'].mean().reset_index()
+
+monthly_avg = train.groupby(['item','store','month'])['sales'].mean().reset_index()
+
+def merge(df1, df2, col,col_name):
+    
+    df1 =pd.merge(df1, df2, how='left', on=None, left_on=col, right_on=col,
+            left_index=False, right_index=False, sort=True,
+             copy=True, indicator=False)
+    
+    df1 = df1.rename(columns={'sales':col_name})
+    return df1
+
+
+test = merge(test, daily_avg,['item','store','dayofweek'],'daily_avg')
+test = merge(test, monthly_avg,['item','store','month'],'monthly_avg')
+
+rolling_10 = train.groupby(['item'])['sales'].rolling(10).mean().reset_index().drop('level_1', axis=1)
+train['rolling_mean'] = rolling_10['sales'] 
+
+
+rolling_last90 = train.groupby(['item','store'])['rolling_mean'].tail(90).copy()
+test['rolling_mean'] = rolling_last90.reset_index().drop('index', axis=1)
+
+
+train['rolling_mean'] = train.groupby(['item'])['rolling_mean'].shift(90) # Create a feature with rolling mean of day - 90
+train.head()
+
+for df in [train, test]:
+    df.drop(['dayofyear', 
+                  'weekofyear',
+                  'daily_avg',
+                  'day',
+                  'month',
+                  'item',
+                  'store',],
+                 axis=1, 
+                 inplace=True)
+    
+
+sales_series, id_series = train['sales'], test['id']
+
+train = (train - train.mean()) / train.std()
+test = (test - test.mean()) / test.std()
+
+train['sales'] = sales_series
+test['id'] = id_series
+
+
+X_train = train.drop('sales', axis=1).dropna()
+y_train = train['sales']
+
+test.sort_values(by=['id'], inplace=True)
+X_test = test.drop('id', axis=1)
+
+df_train = train.copy()
+
+
+X_train , X_test ,y_train, y_test = train_test_split(df_train.drop('sales',axis=1),df_train.pop('sales'), random_state=123, test_size=0.2)
+
+
+matrix_train = xgb.DMatrix(X_train, label = y_train)
+matrix_test = xgb.DMatrix(X_test, label = y_test)
+
+
+model = xgb.train(params={'objective':'reg:linear','eval_metric':'mae'}
+                ,dtrain = matrix_train, num_boost_round = 500, 
+                early_stopping_rounds = 20, evals = [(matrix_test,'test')],)
+
+def roll_mean(df_sales, n_days):
+    df_roll = df_sales.rolling(n_days).mean().round(0)
+ 
+    return df_roll.dropna()
+
+def forecastxgb_sum_n(df_fcst, n_window, rolling_ndays):
+    df_ft3n = df_fcst.rolling(window=n_window).sum().shift(-2)
+    df_ft3n = df_ft3n.iloc[rolling_ndays-1:]
+
+    return df_ft3n
+
+
+def forecastrm_sum_n(df_roll, n_window):
+    return df_roll * n_window
+
+
+def actual_sum_p(df_sales, days_p):
+    df_act_p = df_sales.rolling(window = days_p).sum().shift(-(days_p-1))
+    return df_act_p
+
+def error_calc(df_sales, df_fcst, df_roll, rolling_ndays, frcst_n_days):
+    
+    
+    df_roll = roll_mean(df_sales, rolling_ndays)
+
+  
+    df_ft_n = forecastxgb_sum_n(df_fcst, frcst_n_days, rolling_ndays)
+
+
+    df_rm_n = forecastrm_sum_n(df_roll, frcst_n_days)
+
+   
+    delta_ft, delta_rm, delta_ft_n, df_sales_n, delta_rm_n, delta_rm_max, delta_ft_max = delta_frcst(df_sales, df_ft_n, df_rm_n, 
+                                                                                         frcst_n_days, rolling_ndays)
+    
+    return delta_ft_n, df_sales_n, delta_rm_n, delta_rm_max, delta_ft_max, df_ft_n, df_rm_n
